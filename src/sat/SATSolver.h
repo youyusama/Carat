@@ -34,8 +34,8 @@ class SATSolver {
         return m_slv->Failed(assumption);
     }
 
-    bool MLQP(int strategy) {
-        return m_slv->MLQP(strategy);
+    bool MLQP(const Cube &coreAssumptions, int strategy) {
+        return m_slv->MLQP(coreAssumptions, strategy);
     }
 
     Var GetNewVar() {
