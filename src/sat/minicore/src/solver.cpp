@@ -82,17 +82,17 @@ void Solver::reset() {
 }
 
 
-bool Solver::mlqp(int strategy) {
+bool Solver::mlqp(const std::vector<Lit> &core_assumps, int strategy) {
     mlqp_bypass_reduced_literals = 0;
     if (state_ != SolverState::Solved || last_result_ != l_False)
         return false;
     if (strategy <= 0 || strategy > 2)
         return false;
-    if (failed_core.size() < 3 || nVars() == 0)
+    if (core_assumps.size() < 3 || nVars() == 0)
         return false;
 
     m_mlqpStrategy = strategy;
-    return reduceMLQPCore();
+    return reduceMLQPCore(core_assumps);
 }
 
 

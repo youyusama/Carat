@@ -696,10 +696,6 @@ IC3::ALLProveStatus IC3::ActiveProve(int targetLemmaId) {
         Cube ctp_cube_sorted(ctp_cube);
         OrderAssumption(ctp_cube_sorted);
         if (IsInductive(ctp_cube_sorted, ctp_solver)) {
-            if (m_settings.mlqp > 0) {
-                [[maybe_unused]] auto mlqp_scope = m_log.Section("IC3_MLQP");
-                ctp_solver->MLQP(m_settings.mlqp);
-            }
             auto ctp_core = GetAndValidateCore(ctp_solver, ctp_cube);
             Generalize(ctp_core, ctp_level - 1, 0);
             int ctp_lemma_id = AddLemma(ctp_core, ctp_level);
@@ -1008,10 +1004,6 @@ bool IC3::HandleObligations() {
         OrderAssumption(cti_cube_sorted);
 
         if (!IsReachable(cti_cube_sorted, trans_slv)) {
-            if (m_settings.mlqp > 0) {
-                [[maybe_unused]] auto mlqp_scope = m_log.Section("IC3_MLQP");
-                trans_slv->MLQP(m_settings.mlqp);
-            }
             auto uc = GetAndValidateCore(trans_slv, cti_cube);
             Generalize(uc, ob->level);
             int lemma_id = AddLemma(uc, ob->level + 1, true);
@@ -1106,10 +1098,6 @@ bool IC3::Down(Cube &downCube, int frameLvl, int recLvl, const LitSet &triedLits
 
         // inductive check
         if (IsInductive(downCube, trans_slv)) {
-            if (m_settings.mlqp > 0) {
-                [[maybe_unused]] auto mlqp_scope = m_log.Section("IC3_MLQP");
-                trans_slv->MLQP(m_settings.mlqp);
-            }
             Cube down_core = GetAndValidateCore(trans_slv, downCube);
             downCube.swap(down_core);
             return true;
@@ -1234,6 +1222,24 @@ bool IC3::ExCTGBlock(const Cube &cb, int frameLvl, int recLvl, int blockLimit) {
 
 void IC3::Generalize(Cube &cb, int frameLvl, int recLvl) {
     [[maybe_unused]] auto scoped = m_log.Section("IC3_Gen");
+
+    if (m_settings.mlqp > 0) {
+        auto &solver = m_transSolvers[frameLvl];
+        bool reduced;
+        {
+            [[maybe_unused]] auto mlqp_scope = m_log.Section("IC3_MLQP");
+            OrderAssumption(cb);
+            Cube core_assumps(cb);
+            GetPrimed(core_assumps);
+            solver->SetTempDomainCOI(core_assumps);
+            reduced = solver->MLQP(core_assumps, m_settings.mlqp);
+        }
+        if (reduced) {
+            Cube core = GetAndValidateCore(solver, cb);
+            if (core.size() < cb.size()) cb.swap(core);
+        }
+    }
+
     LOG_L(m_log, 3, "Generalizing Cube: ", CubeToStr(cb), ", at frameLvl: ", frameLvl, ", recLvl: ", recLvl);
 
     Cube blocker;
