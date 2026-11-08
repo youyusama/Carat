@@ -6,6 +6,8 @@ namespace {
 
 // Support sets are packed bitsets over the current unsat core.
 constexpr size_t MLQPSupportMaskBits = 64;
+constexpr unsigned MLQPEntryFlag = 1u;
+constexpr unsigned MLQPSupportFlag = 4u;
 
 inline size_t MLQPSupportChunks(size_t bits) {
     return (bits + MLQPSupportMaskBits - 1) / MLQPSupportMaskBits;
@@ -64,40 +66,24 @@ inline size_t MLQPPendingHash(CRef cr) {
 
 } // namespace
 
-
 void Solver::initMLQPState(size_t core_size) {
     mlqp_core_size = core_size;
     mlqp_best_size = core_size;
     mlqp_support_chunks = MLQPSupportChunks(core_size);
 
-    if (++mlqp_support_stamp == 0) {
-        std::fill(mlqp_support_stamps.begin(), mlqp_support_stamps.end(), 0);
-        std::fill(mlqp_pending_stamps.begin(), mlqp_pending_stamps.end(), 0);
-        std::fill(mlqp_pending_seen_stamps.begin(), mlqp_pending_seen_stamps.end(), 0);
-        ++mlqp_support_stamp;
-    }
-    mlqp_pending_seen_used = 0;
-    const size_t lit_capacity = static_cast<size_t>(alloced_var) * 2 + 1;
-    mlqp_assumption_indices.resize(lit_capacity, size_t(-1));
+    resetMLQPPendingIndex();
+    assert(mlqp_entries.empty());
+    mlqp_pending_entries.clear();
+    mlqp_pending_clauses.clear();
     for (size_t target : mlqp_bypass_targets)
         mlqp_bypass_rules[target].clear();
     mlqp_bypass_targets.clear();
-    if (mlqp_bypass_rules.size() < core_size)
+    if (m_mlqpStrategy == 2 && mlqp_bypass_rules.size() < core_size)
         mlqp_bypass_rules.resize(core_size);
     mlqp_support_pool.clear();
-    if (mlqp_support_offsets.size() < lit_capacity) {
-        mlqp_support_offsets.resize(lit_capacity);
-        mlqp_support_sizes.resize(lit_capacity, 0);
-        mlqp_support_stamps.resize(lit_capacity, 0);
-    }
-    if (m_mlqpStrategy > 0 && mlqp_pending_clauses.size() < lit_capacity) {
-        mlqp_pending_clauses.resize(lit_capacity);
-        mlqp_pending_stamps.resize(lit_capacity, 0);
-    }
     if (m_mlqpStrategy > 0) {
-        // markMLQPPendingClause grows this table as needed. Most queries touch
-        // only a small part of the formula; avoid zeroing a formula-sized table.
-        reserveMLQPPendingSeen(16);
+        // Grow on demand; reuse the table across calls.
+        reserveMLQPPendingIndex(16);
     }
 
     ClearMLQPSupport(mlqp_zero_support, mlqp_support_chunks);
@@ -112,11 +98,39 @@ void Solver::initMLQPState(size_t core_size) {
     mlqp_bucket_heads.assign(bucket_count, 0);
 }
 
+const Solver::MLQPEntry *Solver::findMLQPEntry(Lit p) const {
+    const unsigned bit = MLQPEntryFlag << sign(p);
+    if (!(seen[var(p)] & bit)) return nullptr;
+    const size_t index = failed_stamp[toInt(p)];
+    assert(index < mlqp_entries.size() && mlqp_entries[index].literal == p);
+    return &mlqp_entries[index];
+}
+
+Solver::MLQPEntry &Solver::ensureMLQPEntry(Lit p) {
+    if (findMLQPEntry(p)) return mlqp_entries[failed_stamp[toInt(p)]];
+    const size_t index = mlqp_entries.size();
+    assert(index < UINT32_MAX);
+    mlqp_entries.push_back({p, failed_stamp[toInt(p)]});
+    // Mutate borrowed SAT storage only after allocation succeeds.
+    failed_stamp[toInt(p)] = static_cast<uint32_t>(index);
+    seen[var(p)] |= MLQPEntryFlag << sign(p);
+    return mlqp_entries.back();
+}
+
+void Solver::restoreMLQPState() {
+    for (const auto &entry : mlqp_entries) {
+        failed_stamp[toInt(entry.literal)] = entry.saved_failed_stamp;
+        seen[var(entry.literal)] = 0;
+    }
+    mlqp_entries.clear();
+}
+
 MLQPSupportLookup Solver::lookupMLQPSupport(Lit p) const {
-    const int key = toInt(p);
-    if (key >= 0 && static_cast<size_t>(key) < mlqp_support_stamps.size() &&
-        mlqp_support_stamps[key] == mlqp_support_stamp) {
-        return {mlqp_support_pool.data() + mlqp_support_offsets[key], mlqp_support_sizes[key]};
+    if (seen[var(p)] & (MLQPSupportFlag << sign(p))) {
+        const auto *entry = &mlqp_entries[failed_stamp[toInt(p)]];
+        if (mlqp_support_chunks == 1)
+            return {&entry->inline_support, entry->support_size};
+        return {mlqp_support_pool.data() + entry->support_offset, entry->support_size};
     }
 
     if (value(p) == l_True && level(var(p)) == 0) {
@@ -138,13 +152,10 @@ void Solver::updateMLQPBestCore(const MLQPSupportSet &support, size_t support_si
 }
 
 void Solver::updateMLQPSupport(Lit p, const MLQPSupportSet &cand_support, size_t cand_size) {
-    const int key = toInt(p);
-    assert(key >= 0);
-    assert(static_cast<size_t>(key) < mlqp_support_offsets.size());
-
     // An alternative support need not improve the singleton {p}. Save it before
     // either size cutoff, but never record a rule that depends on its own head.
-    const size_t assumption = mlqp_assumption_indices[key];
+    const auto *existing = findMLQPEntry(p);
+    const size_t assumption = existing ? existing->assumption : size_t(-1);
     if (m_mlqpStrategy == 2 && assumption != size_t(-1) &&
         !MLQPSupportHasBit(cand_support, assumption)) {
         auto &rules = mlqp_bypass_rules[assumption];
@@ -163,15 +174,18 @@ void Solver::updateMLQPSupport(Lit p, const MLQPSupportSet &cand_support, size_t
     if (old_support.bits != nullptr && cand_size >= old_support.size) {
         return;
     }
-    if (mlqp_support_stamps[key] != mlqp_support_stamp) {
-        mlqp_support_offsets[key] = mlqp_support_pool.size();
+    auto &entry = ensureMLQPEntry(p);
+    if (mlqp_support_chunks == 1) {
+        entry.inline_support = cand_support[0];
+    } else if (entry.support_size == size_t(-1)) {
+        entry.support_offset = mlqp_support_pool.size();
         mlqp_support_pool.insert(mlqp_support_pool.end(), cand_support.begin(), cand_support.end());
     } else {
         std::copy(cand_support.begin(), cand_support.end(),
-                  mlqp_support_pool.begin() + mlqp_support_offsets[key]);
+                  mlqp_support_pool.begin() + entry.support_offset);
     }
-    mlqp_support_sizes[key] = cand_size;
-    mlqp_support_stamps[key] = mlqp_support_stamp;
+    entry.support_size = cand_size;
+    seen[var(p)] |= MLQPSupportFlag << sign(p);
     mlqp_buckets[cand_size].push_back(p);
 
     MLQPSupportLookup opp_support = lookupMLQPSupport(~p);
@@ -225,22 +239,22 @@ void Solver::reduceMLQPBypassCore() {
     mlqp_bypass_reduced_literals = before_size - mlqp_best_size;
 }
 
-void Solver::addMLQPPendingClause(Lit p, CRef cr) {
-    if (m_mlqpStrategy <= 0)
-        return;
-
-    const int key = toInt(p);
-    assert(key >= 0);
-    assert(static_cast<size_t>(key) < mlqp_pending_clauses.size());
-    if (mlqp_pending_stamps[key] != mlqp_support_stamp) {
-        mlqp_pending_clauses[key].clear();
-        mlqp_pending_stamps[key] = mlqp_support_stamp;
-    }
-    mlqp_pending_clauses[key].push_back(cr);
+void Solver::addMLQPPendingClause(Lit p, uint32_t clause_index) {
+    assert(mlqp_pending_entries.size() < UINT32_MAX);
+    auto &entry = ensureMLQPEntry(p);
+    mlqp_pending_entries.push_back({clause_index, entry.pending_head});
+    entry.pending_head = static_cast<uint32_t>(mlqp_pending_entries.size() - 1);
 }
 
-void Solver::reserveMLQPPendingSeen(size_t min_entries) {
-    size_t capacity = mlqp_pending_seen_keys.size();
+void Solver::resetMLQPPendingIndex() {
+    if (++mlqp_pending_epoch == 0) {
+        std::fill(mlqp_pending_stamps.begin(), mlqp_pending_stamps.end(), 0);
+        ++mlqp_pending_epoch;
+    }
+}
+
+void Solver::reserveMLQPPendingIndex(size_t min_entries) {
+    size_t capacity = mlqp_pending_indices.size();
     if (capacity != 0 && capacity * 3 >= min_entries * 4)
         return;
 
@@ -248,84 +262,170 @@ void Solver::reserveMLQPPendingSeen(size_t min_entries) {
     while (new_capacity * 3 < min_entries * 4)
         new_capacity <<= 1;
 
-    std::vector<CRef> old_keys = std::move(mlqp_pending_seen_keys);
-    std::vector<uint32_t> old_stamps = std::move(mlqp_pending_seen_stamps);
-    mlqp_pending_seen_keys.assign(new_capacity, CRef_Undef);
-    mlqp_pending_seen_stamps.assign(new_capacity, 0);
+    // Keep the old table valid if either allocation fails.
+    std::vector<uint32_t> new_indices(new_capacity, UINT32_MAX);
+    std::vector<uint32_t> new_stamps(new_capacity, 0);
 
-    const uint32_t stamp = mlqp_support_stamp;
+    const uint32_t stamp = mlqp_pending_epoch;
     const size_t mask = new_capacity - 1;
-    mlqp_pending_seen_used = 0;
-    for (size_t i = 0; i < old_keys.size(); i++) {
-        if (old_stamps[i] != stamp)
+    for (size_t i = 0; i < mlqp_pending_indices.size(); i++) {
+        if (mlqp_pending_stamps[i] != stamp)
             continue;
 
-        CRef cr = old_keys[i];
+        const uint32_t index = mlqp_pending_indices[i];
+        CRef cr = mlqp_pending_clauses[index].clause;
         size_t pos = MLQPPendingHash(cr) & mask;
-        while (mlqp_pending_seen_stamps[pos] == stamp)
+        while (new_stamps[pos] == stamp)
             pos = (pos + 1) & mask;
-        mlqp_pending_seen_keys[pos] = cr;
-        mlqp_pending_seen_stamps[pos] = stamp;
-        mlqp_pending_seen_used++;
+        new_indices[pos] = index;
+        new_stamps[pos] = stamp;
     }
+    mlqp_pending_indices.swap(new_indices);
+    mlqp_pending_stamps.swap(new_stamps);
+}
+
+uint32_t Solver::findMLQPPendingClause(CRef cr) const {
+    if (mlqp_pending_clauses.empty()) return UINT32_MAX;
+    const uint32_t stamp = mlqp_pending_epoch;
+    const size_t mask = mlqp_pending_indices.size() - 1;
+    size_t pos = MLQPPendingHash(cr) & mask;
+    while (mlqp_pending_stamps[pos] == stamp) {
+        const uint32_t index = mlqp_pending_indices[pos];
+        if (mlqp_pending_clauses[index].clause == cr) return index;
+        pos = (pos + 1) & mask;
+    }
+    return UINT32_MAX;
 }
 
 bool Solver::markMLQPPendingClause(CRef cr) {
-    reserveMLQPPendingSeen(mlqp_pending_seen_used + 1);
+    if (findMLQPPendingClause(cr) != UINT32_MAX) return false;
+    // Skip registration unless every pending notification fits.
+    constexpr size_t max_entries = UINT32_MAX;
+    if (mlqp_pending_clauses.size() >= max_entries ||
+        mlqp_pending_entries.size() >= max_entries ||
+        mlqp_unresolved_clause_tmp.size() > max_entries - mlqp_pending_entries.size())
+        return false;
+    reserveMLQPPendingIndex(mlqp_pending_clauses.size() + 1);
+    const uint32_t index = static_cast<uint32_t>(mlqp_pending_clauses.size());
+    assert(mlqp_unresolved_clause_tmp.size() >= 2);
+    mlqp_pending_clauses.push_back({cr, mlqp_unresolved_clause_tmp[0],
+                                    mlqp_unresolved_clause_tmp[1]});
 
-    const uint32_t stamp = mlqp_support_stamp;
-    const size_t mask = mlqp_pending_seen_keys.size() - 1;
+    const uint32_t stamp = mlqp_pending_epoch;
+    const size_t mask = mlqp_pending_indices.size() - 1;
     size_t pos = MLQPPendingHash(cr) & mask;
-    while (mlqp_pending_seen_stamps[pos] == stamp) {
-        if (mlqp_pending_seen_keys[pos] == cr)
-            return false;
-        pos = (pos + 1) & mask;
-    }
-
-    mlqp_pending_seen_keys[pos] = cr;
-    mlqp_pending_seen_stamps[pos] = stamp;
-    mlqp_pending_seen_used++;
+    while (mlqp_pending_stamps[pos] == stamp) pos = (pos + 1) & mask;
+    mlqp_pending_indices[pos] = index;
+    mlqp_pending_stamps[pos] = stamp;
     return true;
 }
 
+bool Solver::mlqpPendingBlocked(uint32_t index) {
+    auto &pending = mlqp_pending_clauses[index];
+    if (pending.cursor == UINT32_MAX) return false;
+
+    // Negative support takes precedence and remains present for this call.
+    auto is_false = [this](Lit p) {
+        return (seen[var(p)] & (MLQPSupportFlag << !sign(p))) ||
+               (value(p) == l_False && level(var(p)) == 0);
+    };
+    if (is_false(pending.first)) pending.first = lit_Undef;
+    if (is_false(pending.second)) pending.second = lit_Undef;
+    if (pending.first != lit_Undef && pending.second != lit_Undef) return true;
+
+    const Clause &clause = ca->get_clause(pending.clause);
+    while (pending.cursor < clause.size()) {
+        Lit q = clause[pending.cursor++];
+        if (q == pending.first || q == pending.second || is_false(q)) continue;
+        if (pending.first == lit_Undef)
+            pending.first = q;
+        else
+            pending.second = q;
+        if (pending.first != lit_Undef && pending.second != lit_Undef) return true;
+    }
+    // Keep notifications for later support improvements once the clause is ready.
+    pending.cursor = UINT32_MAX;
+    return false;
+}
+
 void Solver::mlqpScanClause(CRef cr) {
+    if (mlqp_support_chunks == 1)
+        mlqpScanClauseImpl<true>(cr);
+    else
+        mlqpScanClauseImpl<false>(cr);
+}
+
+template <bool SingleWord>
+void Solver::mlqpScanClauseImpl(CRef cr) {
     if (isRemoved(cr))
         return;
 
     Clause &clause = ca->get_clause(cr);
+    // Skip only after a full scan has registered all pending notifications.
+    if (clause.size() > 2) {
+        const uint32_t pending = findMLQPPendingClause(cr);
+        if (pending != UINT32_MAX && mlqpPendingBlocked(pending)) return;
+    }
     bool merged_initialized = false;
     size_t merged_size = 0;
+    MLQPSupportMask merged_word = 0;
     int unresolved = 0;
     Lit local = lit_Undef;
     Lit implied = lit_Undef;
     bool satisfied = false;
-    bool pruned = false;
 
     mlqp_unresolved_clause_tmp.clear();
 
     for (size_t i = 0; i < clause.size(); i++) {
         Lit q = clause[i];
         if (!inDomain(var(q))) {
-            satisfied = true;
-            break;
+            return;
         }
-        MLQPSupportLookup neg_support = lookupMLQPSupport(~q);
+        MLQPSupportLookup neg_support;
+        bool positive_known = false;
+        if constexpr (SingleWord) {
+            // Check both polarities before reading support storage.
+            const unsigned flags = seen[var(q)];
+            if (flags & (MLQPSupportFlag << !sign(q))) {
+                const auto &entry = mlqp_entries[failed_stamp[toInt(~q)]];
+                neg_support.bits = &entry.inline_support;
+            } else {
+                const auto current = assigns[var(q)] ^ sign(q);
+                if (current == assign_False && level(var(q)) == 0)
+                    neg_support.bits = mlqp_zero_support.data();
+                else {
+                    positive_known = (flags & (MLQPSupportFlag << sign(q))) ||
+                                     (current == assign_True && level(var(q)) == 0);
+                }
+            }
+        } else {
+            neg_support = lookupMLQPSupport(~q);
+        }
         // literal is false
         if (neg_support.bits != nullptr) {
-            if (!merged_initialized) {
-                ClearMLQPSupport(mlqp_merged_support, mlqp_support_chunks);
-                merged_initialized = true;
-            }
-            if (!pruned && neg_support.size != 0) {
-                merged_size += MergeMLQPSupportCountNew(mlqp_merged_support, neg_support.bits, mlqp_support_chunks);
+            if constexpr (SingleWord) {
+                const auto previous = merged_word;
+                merged_word |= *neg_support.bits;
+                if (merged_word != previous)
+                    merged_size = __builtin_popcountll(merged_word);
+            } else {
+                if (!merged_initialized) {
+                    ClearMLQPSupport(mlqp_merged_support, mlqp_support_chunks);
+                    merged_initialized = true;
+                }
+                if (neg_support.size != 0)
+                    merged_size += MergeMLQPSupportCountNew(mlqp_merged_support, neg_support.bits, mlqp_support_chunks);
             }
             if (merged_size >= mlqp_best_size && mlqp_best_size < mlqp_core_size) {
-                pruned = true;
+                // Further unions cannot undo this size cutoff.
+                return;
             }
             continue;
         }
 
-        if (lookupMLQPSupport(q).bits != nullptr) {
+        if constexpr (!SingleWord)
+            positive_known = lookupMLQPSupport(q).bits != nullptr;
+        if (positive_known) {
             if (m_mlqpStrategy == 2 && local == lit_Undef) {
                 local = q;
                 continue;
@@ -341,17 +441,20 @@ void Solver::mlqpScanClause(CRef cr) {
         implied = q;
     }
 
-    if (!satisfied && !pruned && unresolved > 1 && markMLQPPendingClause(cr)) {
+    if (!satisfied && unresolved > 1 && markMLQPPendingClause(cr)) {
+        const uint32_t index = static_cast<uint32_t>(mlqp_pending_clauses.size() - 1);
         for (Lit q : mlqp_unresolved_clause_tmp) {
-            addMLQPPendingClause(~q, cr);
+            addMLQPPendingClause(~q, index);
         }
     }
 
-    if (satisfied || pruned || unresolved > 1)
+    if (satisfied || unresolved > 1)
         return;
-    if (!merged_initialized) {
-        ClearMLQPSupport(mlqp_merged_support, mlqp_support_chunks);
-        merged_initialized = true;
+    if constexpr (SingleWord) {
+        mlqp_merged_support.assign(1, merged_word);
+    } else {
+        if (!merged_initialized)
+            ClearMLQPSupport(mlqp_merged_support, mlqp_support_chunks);
     }
     if (local != lit_Undef) {
         if (unresolved == 0) updateMLQPSupport(local, mlqp_merged_support, merged_size);
@@ -376,13 +479,10 @@ void Solver::mlqpPropagate(Lit p) {
         mlqp_propagate_clauses.push_back(watch.cref);
     }
 
-    const int key = toInt(p);
-    assert(key >= 0);
-    assert(static_cast<size_t>(key) < mlqp_pending_clauses.size());
-    if (mlqp_pending_stamps[key] == mlqp_support_stamp) {
-        auto &pending = mlqp_pending_clauses[key];
-        mlqp_propagate_clauses.insert(mlqp_propagate_clauses.end(), pending.begin(), pending.end());
-    }
+    const auto *entry = findMLQPEntry(p);
+    for (uint32_t index = entry ? entry->pending_head : UINT32_MAX;
+         index != UINT32_MAX; index = mlqp_pending_entries[index].next)
+        mlqp_propagate_clauses.push_back(mlqp_pending_clauses[mlqp_pending_entries[index].clause_index].clause);
 
     std::sort(mlqp_propagate_clauses.begin(), mlqp_propagate_clauses.end());
     CRef last = CRef_Undef;
@@ -397,9 +497,29 @@ void Solver::mlqpPropagate(Lit p) {
 }
 
 bool Solver::reduceMLQPCore() {
+    // Borrow cleared seen and failed_stamp; restore before failed() or SAT runs.
+    struct RestoreState {
+        Solver &solver;
+        bool active = true;
+        ~RestoreState() {
+            if (active) {
+                solver.restoreMLQPState();
+            }
+        }
+        void finish() {
+            solver.restoreMLQPState();
+            active = false;
+        }
+    } restore{*this};
+    // Preserve the input order when assigning support bits and queuing assumptions.
     initMLQPState(failed_core.size());
-    for (size_t i = 0; i < failed_core.size(); ++i)
-        mlqp_assumption_indices[toInt(failed_core[i])] = i;
+    if (m_mlqpStrategy == 2) {
+        for (size_t i = 0; i < failed_core.size(); ++i) {
+            auto &entry = ensureMLQPEntry(failed_core[i]);
+            // Repeated primed literals use their first singleton support.
+            if (entry.assumption == size_t(-1)) entry.assumption = i;
+        }
+    }
 
     if (temp_cls_activated) {
         ClearMLQPSupport(mlqp_work_support, mlqp_support_chunks);
@@ -417,10 +537,8 @@ bool Solver::reduceMLQPCore() {
         while (head < bucket.size()) {
             Lit p = bucket[head++];
 
-            const int key = toInt(p);
-            if (key < 0 || static_cast<size_t>(key) >= mlqp_support_stamps.size() ||
-                mlqp_support_stamps[key] != mlqp_support_stamp ||
-                mlqp_support_sizes[key] != bucket_size)
+            const auto *entry = findMLQPEntry(p);
+            if (!entry || entry->support_size != bucket_size)
                 continue;
             if (bucket_size >= mlqp_best_size)
                 break;
@@ -430,8 +548,8 @@ bool Solver::reduceMLQPCore() {
     }
     // Bypass can reduce the core even when propagation cannot.
     if (m_mlqpStrategy == 2) reduceMLQPBypassCore();
-    for (Lit p : failed_core)
-        mlqp_assumption_indices[toInt(p)] = size_t(-1);
+    // Restore failed marks before publishing the smaller core.
+    restore.finish();
 
     if (mlqp_best_size >= failed_core.size())
         return false;
