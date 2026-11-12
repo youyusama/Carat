@@ -1081,11 +1081,10 @@ static bool LitTrueInModel(const std::shared_ptr<SATSolver> &solver, Lit lit) {
 }
 
 
-bool IC3::Down(Cube &downCube, int frameLvl, int recLvl, const LitSet &triedLits, const Cube &fullCube, std::vector<std::pair<LitSet, LitSet>> &cexCache) {
+bool IC3::Down(Cube &downCube, int frameLvl, int recLvl, const LitSet &triedLits) {
     [[maybe_unused]] auto scoped = m_log.Section("IC3_Down");
     LOG_L(m_log, 3, "Down: ", CubeToStr(downCube), " at frame level ", frameLvl, " and recursion level ", recLvl);
     int ctgs = 0;
-    int joins = 0;
     LitSet ctg_lits;
     auto &trans_slv = m_transSolvers[frameLvl];
 
@@ -1095,13 +1094,6 @@ bool IC3::Down(Cube &downCube, int frameLvl, int recLvl, const LitSet &triedLits
         // initial state inclusion check
         if (!InitiationCheck(downCube)) {
             return false;
-        }
-
-        // cex cache check
-        for (const auto &[s, t] : cexCache) {
-            if (!SubsumeSet(downCube, s) && SubsumeSet(downCube, t)) {
-                return false;
-            }
         }
 
         // inductive check
@@ -1118,52 +1110,21 @@ bool IC3::Down(Cube &downCube, int frameLvl, int recLvl, const LitSet &triedLits
         // plain join down
         if (recLvl >= m_settings.ctgMaxRecursionDepth) {
             Cube cube_new;
-            bool keep_conflict = false;
 
             for (Lit lit : downCube) {
                 bool lit_true = LitTrueInModel(trans_slv, lit);
-
-                if (triedLits.Has(lit) && !lit_true) {
-                    keep_conflict = true;
-                    break;
-                }
-
-                if (lit_true) cube_new.push_back(lit);
+                if (lit_true)
+                    cube_new.push_back(lit);
+                else if (triedLits.Has(lit))
+                    return false;
             }
-
-            LitSet s;
-            LitSet t;
-            for (Lit lit : fullCube) {
-                Lit base_lit = MkLit(VarOf(lit));
-
-                Tbool val = trans_slv->GetModel(VarOf(lit));
-                if (val == T_TRUE) {
-                    s.Insert(base_lit);
-                } else if (val == T_FALSE) {
-                    s.Insert(~base_lit);
-                }
-
-                Lit lit_p = m_model.LookupPrime(lit);
-                Tbool val_p = trans_slv->GetModel(VarOf(lit_p));
-                if (val_p == T_TRUE) {
-                    t.Insert(base_lit);
-                } else if (val_p == T_FALSE) {
-                    t.Insert(~base_lit);
-                }
-            }
-            cexCache.emplace_back(std::move(s), std::move(t));
-
-            if (keep_conflict) return false;
             if (cube_new.size() == downCube.size()) return false;
-
             downCube.swap(cube_new);
             continue;
         }
 
         for (Lit lit : downCube) {
-            if (!triedLits.Has(lit)) continue;
-
-            if (!LitTrueInModel(trans_slv, lit)) return false;
+            if (triedLits.Has(lit) && !LitTrueInModel(trans_slv, lit)) return false;
         }
 
         // ctg down
@@ -1238,7 +1199,6 @@ void IC3::Generalize(Cube &cb, int frameLvl, int recLvl) {
 
     Cube blocker;
     LitSet tried_lits;
-    std::vector<std::pair<LitSet, LitSet>> cex_cache;
 
     m_lfm.GetParentCube(cb, frameLvl, blocker);
     if (m_settings.referSkipping) {
@@ -1269,7 +1229,7 @@ void IC3::Generalize(Cube &cb, int frameLvl, int recLvl) {
             drop_cube.push_back(cb[j]);
         }
 
-        if (Down(drop_cube, frameLvl, recLvl, tried_lits, cb, cex_cache)) {
+        if (Down(drop_cube, frameLvl, recLvl, tried_lits)) {
             // dropCube is sorted
             cb.swap(drop_cube);
             i = cb.size();

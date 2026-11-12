@@ -89,7 +89,7 @@ class IC3 : public IncrAlg {
 
     void Generalize(Cube &cb, int frameLvl, int recLvl = 0);
 
-    bool Down(Cube &c, int frameLvl, int recLvl, const LitSet &triedLits, const Cube &fullCube, std::vector<std::pair<LitSet, LitSet>> &cexCache);
+    bool Down(Cube &c, int frameLvl, int recLvl, const LitSet &triedLits);
 
     bool ExCTGBlock(const Cube &cb, int frameLvl, int recLvl, int blockLimit);
 
