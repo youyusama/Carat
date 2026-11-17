@@ -600,8 +600,6 @@ int IC3::AddLemma(const Cube &blockingCube, int frameLevel, bool fromCTI) {
 void IC3::ActiveLemmaLearning(int newLemmaId) {
     [[maybe_unused]] auto scoped = m_log.Section("IC3_ALL");
     auto ancestor_chain = m_lfm.GetAncestorChain(newLemmaId);
-    if (ancestor_chain.empty()) return;
-
     auto hot_spots = FindHotSpots(ancestor_chain);
 
     for (int hotspot_lemma_id : hot_spots) {
@@ -611,24 +609,21 @@ void IC3::ActiveLemmaLearning(int newLemmaId) {
         m_allPushAttempted++;
         m_lfm.ResetRefineCountSinceALL(hotspot_lemma_id);
 
-        auto status = ActiveProve(hotspot_lemma_id);
-
-        if (status == ALLProveStatus::Invalidated) {
-            m_allStatusInvalidated++;
-            continue;
-        }
-        if (status == ALLProveStatus::Bailout) {
-            m_allStatusBailout++;
-            continue;
-        }
-        if (status == ALLProveStatus::Reachable) {
+        switch (ActiveProve(hotspot_lemma_id)) {
+        case ALLProveStatus::Proved:
+            m_allStatusProved++;
+            break;
+        case ALLProveStatus::Reachable:
             m_allStatusReachable++;
             m_lfm.MarkReachableChain(hotspot_lemma_id);
-            continue;
+            break;
+        case ALLProveStatus::Bailout:
+            m_allStatusBailout++;
+            break;
+        case ALLProveStatus::Invalidated:
+            m_allStatusInvalidated++;
+            break;
         }
-
-        assert(status == ALLProveStatus::Proved);
-        m_allStatusProved++;
     }
 }
 
@@ -645,20 +640,24 @@ std::vector<int> IC3::FindHotSpots(const std::vector<int> &ancestorChain) {
 }
 
 IC3::ALLProveStatus IC3::ActiveProve(int targetLemmaId) {
+    if (!m_lfm.Alive(targetLemmaId)) return ALLProveStatus::Invalidated;
+
+    // Auxiliary learning can invalidate the target, but cannot move a surviving target.
+    const int goal_level = m_lfm.FrameLevelOf(targetLemmaId);
+    if (goal_level < 1 || goal_level > m_k) return ALLProveStatus::Invalidated;
+    assert(goal_level < static_cast<int>(m_transSolvers.size()));
+
     int attempts_left = m_settings.allMaxStates;
+    while (m_lfm.Alive(targetLemmaId)) {
+        Cube ctp_cube;
+        int ctp_level = -1;
 
-    while (true) {
-        if (!m_lfm.Alive(targetLemmaId)) return ALLProveStatus::Invalidated;
-
-        int goal_level = m_lfm.FrameLevelOf(targetLemmaId);
-        if (goal_level < 1 || goal_level > m_k ||
-            goal_level >= static_cast<int>(m_transSolvers.size())) {
-            return ALLProveStatus::Invalidated;
-        }
-
-        const Cube goal_cube = m_lfm.CubeOf(targetLemmaId);
-
-        if (!m_lfm.HasCTPPreds(targetLemmaId)) {
+        if (m_lfm.HasCTPPreds(targetLemmaId)) {
+            if (attempts_left <= 0) return ALLProveStatus::Bailout;
+            [[maybe_unused]] bool popped = m_lfm.PopCTPPred(targetLemmaId, ctp_cube, ctp_level);
+            assert(popped);
+        } else {
+            // Even with no budget left, the last blocked CTP may let the target propagate.
             int lemma_id = targetLemmaId;
             if (Propagate(lemma_id, goal_level)) {
                 if (goal_level < m_minUpdateLevel) m_minUpdateLevel = goal_level;
@@ -667,25 +666,16 @@ IC3::ALLProveStatus IC3::ActiveProve(int targetLemmaId) {
             }
             if (attempts_left <= 0) return ALLProveStatus::Bailout;
 
+            const Cube goal_cube = m_lfm.CubeOf(targetLemmaId);
             auto ctp_assignment = m_transSolvers[goal_level]->GetAssignment(false);
             auto ctp_state = std::make_shared<State>(nullptr, ctp_assignment.first, ctp_assignment.second, 0);
             auto succ_state = std::make_shared<State>(nullptr, Cube{}, goal_cube, 0);
             GeneralizePredecessor(ctp_state, succ_state);
-            m_lfm.PushCTPPred(targetLemmaId, ctp_state->latches, goal_level);
-        }
-
-        if (attempts_left <= 0) return ALLProveStatus::Bailout;
-
-        Cube ctp_cube;
-        int ctp_level = -1;
-        if (!m_lfm.PopCTPPred(targetLemmaId, ctp_cube, ctp_level)) {
-            continue;
+            ctp_cube = std::move(ctp_state->latches);
+            ctp_level = goal_level;
         }
         attempts_left--;
-
-        if (ctp_level < 1 || ctp_level >= static_cast<int>(m_transSolvers.size())) {
-            return ALLProveStatus::Invalidated;
-        }
+        assert(ctp_level >= 1 && ctp_level <= goal_level);
 
         if (GetSubsumeLevel(ctp_cube, ctp_level) != -1) {
             continue;
@@ -715,6 +705,7 @@ IC3::ALLProveStatus IC3::ActiveProve(int targetLemmaId) {
         GeneralizePredecessor(new_ctp_state, pred_succ_state);
         m_lfm.PushCTPPred(targetLemmaId, new_ctp_state->latches, ctp_level - 1);
     }
+    return ALLProveStatus::Invalidated;
 }
 
 
