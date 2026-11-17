@@ -127,7 +127,7 @@ class IC3 : public IncrAlg {
 
     bool PropagateFrame();
 
-    bool Propagate(int lemmaId, int lvl);
+    bool Propagate(int &lemmaId, int lvl);
 
     int PropagateUp(int lemmaId, int startLevel);
 

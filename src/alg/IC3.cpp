@@ -629,11 +629,6 @@ void IC3::ActiveLemmaLearning(int newLemmaId) {
 
         assert(status == ALLProveStatus::Proved);
         m_allStatusProved++;
-
-        if (!m_lfm.Alive(hotspot_lemma_id)) continue;
-
-        const int frame_level = m_lfm.FrameLevelOf(hotspot_lemma_id);
-        PropagateUp(hotspot_lemma_id, frame_level);
     }
 }
 
@@ -656,14 +651,18 @@ IC3::ALLProveStatus IC3::ActiveProve(int targetLemmaId) {
         if (!m_lfm.Alive(targetLemmaId)) return ALLProveStatus::Invalidated;
 
         int goal_level = m_lfm.FrameLevelOf(targetLemmaId);
-        if (goal_level < 1 || goal_level >= static_cast<int>(m_transSolvers.size())) {
+        if (goal_level < 1 || goal_level > m_k ||
+            goal_level >= static_cast<int>(m_transSolvers.size())) {
             return ALLProveStatus::Invalidated;
         }
 
         const Cube goal_cube = m_lfm.CubeOf(targetLemmaId);
 
         if (!m_lfm.HasCTPPreds(targetLemmaId)) {
-            if (!IsReachable(goal_cube, m_transSolvers[goal_level])) {
+            int lemma_id = targetLemmaId;
+            if (Propagate(lemma_id, goal_level)) {
+                if (goal_level < m_minUpdateLevel) m_minUpdateLevel = goal_level;
+                PropagateUp(lemma_id, goal_level + 1);
                 return ALLProveStatus::Proved;
             }
             if (attempts_left <= 0) return ALLProveStatus::Bailout;
@@ -1412,7 +1411,7 @@ bool IC3::IsReachable(const Cube &cb, const std::shared_ptr<SATSolver> &slv) {
 // @input:
 // @output:
 // ================================================================================
-bool IC3::Propagate(int lemmaId, int lvl) {
+bool IC3::Propagate(int &lemmaId, int lvl) {
     [[maybe_unused]] auto scoped = m_log.Section("IC3_Prop");
     bool result;
     Cube cb = m_lfm.CubeOf(lemmaId);
@@ -1420,7 +1419,7 @@ bool IC3::Propagate(int lemmaId, int lvl) {
     if (!IsReachable(cb, m_transSolvers[lvl])) {
         auto core = GetAndValidateCore(m_transSolvers[lvl], cb);
         if (core.size() < cb.size()) {
-            AddLemma(core, lvl + 1);
+            lemmaId = AddLemma(core, lvl + 1);
         } else {
             int propagated_level = m_lfm.PropagateLemma(lemmaId, lvl + 1);
             AddLemmaToSolvers(cb, propagated_level, propagated_level);
